@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -30,6 +32,58 @@ import (
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
 )
+
+// Runtime config from env so several bridges (one per WhatsApp account) can run
+// side by side. Defaults keep the original single-account layout.
+var (
+	storeDir            = getEnv("WHATSAPP_STORE_DIR", "store")
+	apiPort, apiPortErr = parsePortEnv("WHATSAPP_PORT", 8080)
+)
+
+// getEnv returns the env var value, or def when unset/empty
+func getEnv(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+// parsePortEnv returns def when the env var is unset or empty, and an error for any
+// other value that is not a TCP port. Invalid values are not replaced by the default,
+// so a typo cannot silently put a second account's bridge on the first one's port.
+func parsePortEnv(key string, def int) (int, error) {
+	raw := os.Getenv(key)
+	v := strings.TrimSpace(raw)
+	if v == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 || n > 65535 {
+		return 0, fmt.Errorf("invalid %s=%q: must be a port number from 1 to 65535", key, raw)
+	}
+	return n, nil
+}
+
+// validateStoreDir rejects characters that SQLite would parse as URI syntax in the
+// "file:<dir>/x.db?..." DSNs, which could open a different path than the one created.
+func validateStoreDir(dir string) error {
+	if strings.ContainsAny(dir, "?#%") {
+		return fmt.Errorf("invalid WHATSAPP_STORE_DIR=%q: must not contain '?', '#' or '%%'", dir)
+	}
+	return nil
+}
+
+// listenAPI binds the REST API on the loopback interface. Binding happens at startup,
+// before connecting to WhatsApp, so a port clash stops the bridge instead of leaving
+// it running without an API (or with another bridge answering on that port).
+func listenAPI(port int) (net.Listener, error) {
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("REST API cannot listen on %s: %w", addr, err)
+	}
+	return ln, nil
+}
 
 // Message represents a chat message for our client
 type Message struct {
@@ -49,11 +103,11 @@ type MessageStore struct {
 // Initialize message store
 func NewMessageStore() (*MessageStore, error) {
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+	if err := os.MkdirAll(storeDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create store directory: %v", err)
 	}
 
-	return openMessageStore(filepath.Join("store", "messages.db"))
+	return openMessageStore(filepath.Join(storeDir, "messages.db"))
 }
 
 // openMessageStore opens (creating if needed) the message database at dbPath.
@@ -712,7 +766,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var err error
 
 	// Per-chat media directory; the chat JID must form a single path component.
-	chatDir, err := mediaChatDir("store", chatJID)
+	chatDir, err := mediaChatDir(storeDir, chatJID)
 	if err != nil {
 		return false, "", "", "", err
 	}
@@ -862,7 +916,7 @@ func extractDirectPathFromURL(url string) string {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, ln net.Listener) {
 	// Handler for sending messages
 	http.HandleFunc("/api/send", guardAPI(func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
@@ -1053,16 +1107,15 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	}))
 
-	// Start the server
-	// Bind to loopback only: the local Python MCP server connects via http://localhost:8080
-	// and these endpoints (send/edit/revoke) are unauthenticated, so they must not be exposed
-	// on other interfaces (e.g. Tailscale/LAN).
-	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
-	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
+	// Start the server on the loopback listener opened by listenAPI: the local Python
+	// MCP server connects via http://127.0.0.1:<port> and these endpoints
+	// (send/edit/revoke) are unauthenticated, so they must not be exposed on other
+	// interfaces (e.g. Tailscale/LAN).
+	fmt.Printf("Starting REST API server on %s...\n", ln.Addr())
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
+		if err := http.Serve(ln, nil); err != nil {
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()
@@ -1071,18 +1124,33 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 func main() {
 	// Set up logger
 	logger := waLog.Stdout("Client", "INFO", true)
-	logger.Infof("Starting WhatsApp client...")
+	if apiPortErr != nil {
+		logger.Errorf("%v", apiPortErr)
+		os.Exit(1)
+	}
+	if err := validateStoreDir(storeDir); err != nil {
+		logger.Errorf("%v", err)
+		os.Exit(1)
+	}
+	logger.Infof("Starting WhatsApp client (store=%s, port=%d)...", storeDir, apiPort)
+
+	// Reserve the API port before connecting, so a clash fails fast.
+	apiListener, err := listenAPI(apiPort)
+	if err != nil {
+		logger.Errorf("%v", err)
+		os.Exit(1)
+	}
 
 	// Create database connection for storing session data
 	dbLog := waLog.Stdout("Database", "INFO", true)
 
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+	if err := os.MkdirAll(storeDir, 0755); err != nil {
 		logger.Errorf("Failed to create store directory: %v", err)
 		return
 	}
 
-	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:"+filepath.Join(storeDir, "whatsapp.db")+"?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
@@ -1190,7 +1258,7 @@ func main() {
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
 	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	startRESTServer(client, messageStore, apiListener)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)

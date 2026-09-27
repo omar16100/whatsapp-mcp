@@ -2,6 +2,13 @@
 
 This is a Model Context Protocol (MCP) server for WhatsApp.
 
+> **This is a fork** of [lharries/whatsapp-mcp](https://github.com/lharries/whatsapp-mcp) by Luke Harries.
+> Fork additions: whatsmeow updated (context-aware API), a fix for HTTP 403 on media
+> downloads, the bridge REST API bound to `127.0.0.1` only, a path traversal fix for downloaded
+> document names, draft-to-self tools (`draft_message`, `revise_draft`, `delete_draft`), and
+> per-account env config for running more than one WhatsApp account (see
+> [Multiple accounts](#multiple-accounts)). Change log: [todo.md](todo.md).
+
 With this you can search and read your personal Whatsapp messages (including images, videos, documents, and audio messages), search your contacts and send messages to either individuals or groups. You can also send media files including images, videos, documents, and audio messages.
 
 It connects to your **personal WhatsApp account** directly via the Whatsapp web multidevice API (using the [whatsmeow](https://github.com/tulir/whatsmeow) library). All your messages are stored locally in a SQLite database and only sent to an LLM (such as Claude) when the agent accesses them through tools (which you control).
@@ -10,7 +17,7 @@ Here's an example of what you can do when it's connected to Claude.
 
 ![WhatsApp MCP](./example-use.png)
 
-> To get updates on this and other projects I work on [enter your email here](https://docs.google.com/forms/d/1rTF9wMBTN0vPfzWuQa2BjfGKdKIpTbyeKxhPMcEzgyI/preview)
+> From the upstream author (Luke Harries), not this fork: to get updates on his projects, [enter your email here](https://docs.google.com/forms/d/1rTF9wMBTN0vPfzWuQa2BjfGKdKIpTbyeKxhPMcEzgyI/preview)
 
 > *Caution:* as with many MCP servers, the WhatsApp MCP is subject to [the lethal trifecta](https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/). This means that project injection could lead to private data exfiltration.
 
@@ -29,7 +36,7 @@ Here's an example of what you can do when it's connected to Claude.
 1. **Clone this repository**
 
    ```bash
-   git clone https://github.com/lharries/whatsapp-mcp.git
+   git clone https://github.com/omar16100/whatsapp-mcp.git
    cd whatsapp-mcp
    ```
 
@@ -109,6 +116,26 @@ If you're running this project on Windows, be aware that `go-sqlite3` requires *
 Without this setup, you'll likely run into errors like:
 
 > `Binary was compiled with 'CGO_ENABLED=0', go-sqlite3 requires cgo to work.`
+
+### Multiple accounts
+
+Each WhatsApp account needs its own bridge process, store directory, port and MCP server entry.
+Defaults are unchanged (`store`, port `8080`), so a single account needs no config.
+
+| Variable | Used by | Default |
+|---|---|---|
+| `WHATSAPP_STORE_DIR` | bridge | `store` (relative to the bridge working directory) |
+| `WHATSAPP_PORT` | bridge | `8080` (always bound to `127.0.0.1`; an invalid or busy port stops the bridge at startup) |
+| `WHATSAPP_API_URL` | MCP server | `http://127.0.0.1:8080/api` |
+| `WHATSAPP_DB_PATH` | MCP server | `whatsapp-bridge/store/messages.db` |
+| `WHATSAPP_LOG_CONTENT` | bridge | unset (set to `1` to log message text) |
+| `BRIDGE_LOG`, `QR_PORT` | `whatsapp-bridge/qr_server.py` (pairing page) | `bridge.log` (relative to `whatsapp-bridge/`), `8765` |
+
+Example for a second account: run the bridge with `WHATSAPP_STORE_DIR=store-2 WHATSAPP_PORT=8081`,
+and add a second MCP server entry (for example `"whatsapp-2"`) with the same command plus
+`"env": {"WHATSAPP_API_URL": "http://127.0.0.1:8081/api", "WHATSAPP_DB_PATH": "{{PATH_TO_SRC}}/whatsapp-mcp/whatsapp-bridge/store-2/messages.db"}`.
+`WHATSAPP_API_URL` and `WHATSAPP_DB_PATH` must describe the same account. `WHATSAPP_DB_PATH` is
+used as given (no `~` expansion), so use an absolute path.
 
 ## Architecture Overview
 
@@ -190,10 +217,10 @@ By default, just the metadata of the media is stored in the local database. The 
 > Older media, for example from the initial history sync, can fail with HTTP 403 once its token has
 > expired. Asking the sender's phone to re-upload it (media retry) is not implemented.
 >
-> Downloaded files are saved as `whatsapp-bridge/store/<chat_jid>/<sha256>/<filename>`, where
-> `<sha256>` is the hash of the file content, so attachments with the same name never overwrite
-> each other. Files saved by older versions as `store/<chat_jid>/<filename>` are reused only when
-> their SHA-256 matches the message's media.
+> Downloaded files are saved as `whatsapp-bridge/<store>/<chat_jid>/<sha256>/<filename>` (`store`
+> by default), where `<sha256>` is the hash of the file content, so attachments with the same name
+> never overwrite each other. Files saved by older versions as `<store>/<chat_jid>/<filename>` are
+> reused only when their SHA-256 matches the message's media.
 
 ## Technical Details
 

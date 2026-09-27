@@ -3,12 +3,24 @@ from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
 import os.path
+import logging
 import requests
 import json
 import audio
 
-MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+logger = logging.getLogger("whatsapp_mcp")
+
+# Env overrides let one MCP server per WhatsApp account point at its own bridge
+# (e.g. a second account: WHATSAPP_API_URL=http://127.0.0.1:8081/api,
+# WHATSAPP_DB_PATH=<repo>/whatsapp-bridge/store-2/messages.db). Defaults = original account.
+DEFAULT_MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+# Must be 127.0.0.1, not "localhost". The bridge binds IPv4 loopback only; "localhost"
+# can resolve to ::1 first, and if another process (e.g. Docker publishing the same
+# port) listens on the IPv6 wildcard, writes reach that process instead of the bridge.
+DEFAULT_WHATSAPP_API_BASE_URL = "http://127.0.0.1:8080/api"
+MESSAGES_DB_PATH = os.getenv("WHATSAPP_DB_PATH") or DEFAULT_MESSAGES_DB_PATH
+WHATSAPP_API_BASE_URL = (os.getenv("WHATSAPP_API_URL") or DEFAULT_WHATSAPP_API_BASE_URL).rstrip("/")
+logger.info("config: api=%s db=%s", WHATSAPP_API_BASE_URL, MESSAGES_DB_PATH)
 
 @dataclass
 class Message:
@@ -85,7 +97,7 @@ def get_sender_name(sender_jid: str) -> str:
             return sender_jid
         
     except sqlite3.Error as e:
-        print(f"Database error while getting sender name: {e}")
+        logger.error(f"Database error while getting sender name: {e}")
         return sender_jid
     finally:
         if 'conn' in locals():
@@ -108,7 +120,7 @@ def format_message(message: Message, show_chat_info: bool = True) -> None:
         sender_name = get_sender_name(message.sender) if not message.is_from_me else "Me"
         output += f"From: {sender_name}: {content_prefix}{message.content}\n"
     except Exception as e:
-        print(f"Error formatting message: {e}")
+        logger.error(f"Error formatting message: {e}")
     return output
 
 def format_messages_list(messages: List[Message], show_chat_info: bool = True) -> None:
@@ -216,7 +228,7 @@ def list_messages(
         return format_messages_list(result, show_chat_info=True)    
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        logger.error(f"Database error: {e}")
         return []
     finally:
         if 'conn' in locals():
@@ -309,7 +321,7 @@ def get_message_context(
         )
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        logger.error(f"Database error: {e}")
         raise
     finally:
         if 'conn' in locals():
@@ -383,7 +395,7 @@ def list_chats(
         return result
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        logger.error(f"Database error: {e}")
         return []
     finally:
         if 'conn' in locals():
@@ -425,7 +437,7 @@ def search_contacts(query: str) -> List[Contact]:
         return result
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        logger.error(f"Database error: {e}")
         return []
     finally:
         if 'conn' in locals():
@@ -476,7 +488,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
         return result
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        logger.error(f"Database error: {e}")
         return []
     finally:
         if 'conn' in locals():
@@ -525,7 +537,7 @@ def get_last_interaction(jid: str) -> str:
         return format_message(message)
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        logger.error(f"Database error: {e}")
         return None
     finally:
         if 'conn' in locals():
@@ -573,7 +585,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
         )
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        logger.error(f"Database error: {e}")
         return None
     finally:
         if 'conn' in locals():
@@ -616,7 +628,7 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
         )
         
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
+        logger.error(f"Database error: {e}")
         return None
     finally:
         if 'conn' in locals():
@@ -747,23 +759,23 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
             result = response.json()
             if result.get("success", False):
                 path = result.get("path")
-                print(f"Media downloaded successfully: {path}")
+                logger.info(f"Media downloaded successfully: {path}")
                 return path
             else:
-                print(f"Download failed: {result.get('message', 'Unknown error')}")
+                logger.error(f"Download failed: {result.get('message', 'Unknown error')}")
                 return None
         else:
-            print(f"Error: HTTP {response.status_code} - {response.text}")
+            logger.error(f"Error: HTTP {response.status_code} - {response.text}")
             return None
             
     except requests.RequestException as e:
-        print(f"Request error: {str(e)}")
+        logger.error(f"Request error: {str(e)}")
         return None
     except json.JSONDecodeError:
-        print(f"Error parsing response: {response.text}")
+        logger.error(f"Error parsing response: {response.text}")
         return None
     except Exception as e:
-        print(f"Unexpected error: {str(e)}")
+        logger.error(f"Unexpected error: {str(e)}")
         return None
 
 
