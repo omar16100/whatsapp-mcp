@@ -767,11 +767,13 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
         return None
 
 
-def _post_send(recipient: str, message: str = "", media_path: Optional[str] = None) -> Tuple[bool, str, Optional[dict]]:
+def _post_send(recipient: str, message: str = "", media_path: Optional[str] = None, draft: bool = False) -> Tuple[bool, str, Optional[dict]]:
     """POST to the bridge /api/send and return (ok, info, ids).
 
     Unlike send_message/send_file, this returns the message identifiers the bridge
     now includes (message_id, chat_jid, timestamp) so drafts can be edited/revoked.
+    draft=True asks the bridge to record the message as a draft; only recorded
+    drafts can later be edited or revoked.
     """
     try:
         url = f"{WHATSAPP_API_BASE_URL}/send"
@@ -780,6 +782,8 @@ def _post_send(recipient: str, message: str = "", media_path: Optional[str] = No
             payload["message"] = message
         if media_path:
             payload["media_path"] = media_path
+        if draft:
+            payload["draft"] = True
 
         response = requests.post(url, json=payload)
         if response.status_code == 200:
@@ -788,6 +792,7 @@ def _post_send(recipient: str, message: str = "", media_path: Optional[str] = No
                 "message_id": result.get("message_id"),
                 "chat_jid": result.get("chat_jid"),
                 "timestamp": result.get("timestamp"),
+                "draft_recorded": result.get("draft_recorded"),
             }
             return result.get("success", False), result.get("message", "Unknown response"), ids
         return False, f"Error: HTTP {response.status_code} - {response.text}", None
@@ -817,13 +822,22 @@ def draft_to_self(recipient: str, message: str = "", media_path: Optional[str] =
         return False, "A message or media_path must be provided", None
     if media_path and not os.path.isfile(media_path):
         return False, f"Media file not found: {media_path}", None
+    if media_path and message and media_path.lower().endswith(".ogg"):
+        # .ogg files are sent as voice messages, which carry no caption: the text
+        # would be silently dropped.
+        return False, "Audio (.ogg) drafts cannot carry text; draft the text separately", None
 
     # Post directly to /api/send (keeps the caption for media, which the send_file
-    # wrapper drops). recipient="self" resolves to the user's own JID in the bridge.
-    ok, info, ids = _post_send("self", message, media_path)
+    # wrapper drops). recipient="self" resolves to the user's own chat in the bridge.
+    ok, info, ids = _post_send("self", message, media_path, draft=True)
     if not ok:
         return False, f"Failed to post draft to self-chat: {info}", None
-    return True, f"Draft for {recipient} posted to your WhatsApp self-chat. Review it there and forward it to {recipient}.", ids
+    status = f"Draft for {recipient} posted to your WhatsApp self-chat. Review it there and forward it to {recipient}."
+    if ids and ids.get("draft_recorded") is False:
+        # Delivered, but the bridge could not register it: do not re-send.
+        status += (" Warning: the bridge could not record this draft, so revise_draft and"
+                   " delete_draft will refuse it; edit or delete it in WhatsApp instead.")
+    return True, status, ids
 
 
 def edit_draft(chat_jid: str, message_id: str, new_message: str) -> Tuple[bool, str]:

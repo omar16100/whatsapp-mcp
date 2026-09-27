@@ -25,6 +25,7 @@ def test_draft_to_self_posts_single_clean_message():
     payload = post.call_args.kwargs["json"]
     assert payload["recipient"] == "self"
     assert payload["message"] == "hello there"
+    assert payload["draft"] is True  # bridge records it so only drafts can be edited/revoked
     assert "media_path" not in payload
     assert ids["message_id"] == "MSG2"
     assert ids["chat_jid"] == "6591234567@s.whatsapp.net"
@@ -50,6 +51,43 @@ def test_draft_to_self_rejects_missing_media(tmp_path):
     assert ok is False
     assert ids is None
     assert "not found" in info.lower()
+
+
+def test_draft_to_self_rejects_ogg_with_text(tmp_path):
+    # .ogg is sent as a voice message, which has no caption: refuse instead of dropping text.
+    f = tmp_path / "note.ogg"
+    f.write_bytes(b"OggS")
+    with patch("whatsapp.requests.post") as post:
+        ok, info, ids = whatsapp.draft_to_self("6598765432", "some text", str(f))
+    assert ok is False and ids is None
+    assert "cannot carry text" in info
+    post.assert_not_called()
+
+
+def test_draft_to_self_ogg_without_text_is_allowed(tmp_path):
+    f = tmp_path / "note.ogg"
+    f.write_bytes(b"OggS")
+    ok_body = {"success": True, "message": "ok", "message_id": "M", "chat_jid": "j"}
+    with patch("whatsapp.requests.post", return_value=_resp(ok_body)) as post:
+        ok, _, _ = whatsapp.draft_to_self("6598765432", "", str(f))
+    assert ok is True
+    assert post.call_args.kwargs["json"]["media_path"] == str(f)
+
+
+def test_draft_to_self_surfaces_unrecorded_draft_warning():
+    body = {"success": True, "message": "Message sent to self", "message_id": "M9",
+            "chat_jid": "6591234567@s.whatsapp.net", "draft_recorded": False}
+    with patch("whatsapp.requests.post", return_value=_resp(body)):
+        ok, info, ids = whatsapp.draft_to_self("6598765432", "hi")
+    assert ok is True  # delivered: the caller must not re-send
+    assert "could not record" in info
+    assert ids["message_id"] == "M9" and ids["draft_recorded"] is False
+
+
+def test_regular_send_is_not_marked_draft():
+    with patch("whatsapp.requests.post", return_value=_resp({"success": True, "message": "ok"})) as post:
+        whatsapp.send_message("6598765432", "hi")
+    assert "draft" not in post.call_args.kwargs["json"]
 
 
 def test_edit_draft_hits_edit_endpoint():

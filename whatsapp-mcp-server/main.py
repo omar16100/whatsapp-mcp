@@ -263,9 +263,10 @@ def draft_message(recipient: str, message: str = "", media_path: str = None) -> 
 
     Args:
         recipient: The intended final recipient (phone number without + or a JID). Used only
-                   in the header text; nothing is sent to them.
+                   in the tool's reply text; nothing is sent to them.
         message: The message text (also used as the caption when media_path is given).
         media_path: Optional absolute path to a file/document/image to include in the draft.
+                    .ogg files become voice messages, which cannot carry text.
 
     Returns:
         A dictionary with success status, a status message, and the identifiers
@@ -283,8 +284,9 @@ def draft_message(recipient: str, message: str = "", media_path: str = None) -> 
 def revise_draft(chat_jid: str, message_id: str, new_message: str) -> Dict[str, Any]:
     """Revise the TEXT of a draft previously posted to the self-chat, in place.
 
-    Only works for text drafts and only within WhatsApp's ~20 minute edit window after
-    the draft was posted. For media drafts, delete_draft and draft_message again instead.
+    Only works for text drafts posted by draft_message (the bridge refuses any other
+    message) and only within WhatsApp's ~20 minute edit window after the draft was
+    posted. For media drafts, delete_draft and draft_message again instead.
 
     Args:
         chat_jid: The chat_jid returned by draft_message (the self-chat JID).
@@ -301,6 +303,9 @@ def revise_draft(chat_jid: str, message_id: str, new_message: str) -> Dict[str, 
 @mcp.tool()
 def delete_draft(chat_jid: str, message_id: str) -> Dict[str, Any]:
     """Delete (revoke) a draft message previously posted to the self-chat.
+
+    Only drafts posted by draft_message can be deleted; the bridge refuses any other
+    message.
 
     Args:
         chat_jid: The chat_jid returned by draft_message (the self-chat JID).

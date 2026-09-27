@@ -53,8 +53,13 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create store directory: %v", err)
 	}
 
+	return openMessageStore(filepath.Join("store", "messages.db"))
+}
+
+// openMessageStore opens (creating if needed) the message database at dbPath.
+func openMessageStore(dbPath string) (*MessageStore, error) {
 	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	db, err := sql.Open("sqlite3", "file:"+dbPath+"?_foreign_keys=on")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
@@ -84,7 +89,7 @@ func NewMessageStore() (*MessageStore, error) {
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
-	`)
+	` + createDraftsTableSQL)
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("failed to create tables: %v", err)
@@ -199,6 +204,9 @@ type SendMessageResponse struct {
 	MessageID string `json:"message_id,omitempty"`
 	ChatJID   string `json:"chat_jid,omitempty"`
 	Timestamp string `json:"timestamp,omitempty"`
+	// DraftRecorded is set for draft sends: false means the message was delivered
+	// but could not be registered, so /api/edit and /api/revoke will refuse it.
+	DraftRecorded *bool `json:"draft_recorded,omitempty"`
 }
 
 // SendResult carries the identifiers of a successfully sent message.
@@ -213,6 +221,64 @@ type SendMessageRequest struct {
 	Recipient string `json:"recipient"`
 	Message   string `json:"message"`
 	MediaPath string `json:"media_path,omitempty"`
+	// Draft marks a draft-to-self post. Drafts must target "self"/"me" and are
+	// recorded so /api/edit and /api/revoke can act on them (and nothing else).
+	Draft bool `json:"draft,omitempty"`
+}
+
+// logMessageContent enables logging of message text (off by default).
+var logMessageContent = os.Getenv("WHATSAPP_LOG_CONTENT") == "1"
+
+// isSelfRecipient reports whether a send request targets the user's own chat.
+func isSelfRecipient(recipient string) bool {
+	return recipient == "self" || recipient == "me"
+}
+
+// lidLookup holds the two LID sources whatsmeow's SendMessage uses for
+// phone-number destinations: the local PN->LID cache, then a server user-info query.
+type lidLookup struct {
+	cached func(ctx context.Context, pn types.JID) (types.JID, error)
+	fetch  func(ctx context.Context, pn types.JID) (types.JID, error)
+}
+
+// resolveSendJIDWith mirrors whatsmeow's pre-send rewrite (send.go, "Replacing
+// SendMessage destination with LID"): after the account's LID migration, a
+// phone-number destination is sent to the contact's LID, looked up in the cache and
+// then via GetUserInfo, and the send fails if no LID is found. Resolving it here
+// first gives the same send and lets the API return the real chat JID.
+func resolveSendJIDWith(ctx context.Context, jid types.JID, lidMigrated bool, lk lidLookup) (types.JID, error) {
+	if jid.Server != types.DefaultUserServer || !lidMigrated {
+		return jid, nil
+	}
+	lid, err := lk.cached(ctx, jid)
+	if err != nil {
+		return jid, fmt.Errorf("failed to get LID for %s: %w", jid, err)
+	}
+	if !lid.IsEmpty() {
+		return lid, nil
+	}
+	lid, err = lk.fetch(ctx, jid)
+	if err != nil {
+		return jid, fmt.Errorf("failed to get user info for %s to find its LID: %w", jid, err)
+	}
+	if lid.IsEmpty() {
+		return jid, fmt.Errorf("no LID found for %s", jid)
+	}
+	return lid, nil
+}
+
+// resolveSendJID applies resolveSendJIDWith with the client's LID cache and server.
+func resolveSendJID(ctx context.Context, client *whatsmeow.Client, jid types.JID) (types.JID, error) {
+	return resolveSendJIDWith(ctx, jid, client.Store.LIDMigrationTimestamp > 0, lidLookup{
+		cached: client.Store.LIDs.GetLIDForPN,
+		fetch: func(ctx context.Context, pn types.JID) (types.JID, error) {
+			info, err := client.GetUserInfo(ctx, []types.JID{pn})
+			if err != nil {
+				return types.EmptyJID, err
+			}
+			return info[pn].LID, nil
+		},
+	})
 }
 
 // Function to send a WhatsApp message
@@ -227,11 +293,11 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 	// "self"/"me" targets the linked account's own chat ("Message Yourself"),
 	// used by the draft feature so a message appears in the user's own WhatsApp.
-	if recipient == "self" || recipient == "me" {
-		if client.Store.ID == nil {
-			return false, "Not logged in (no device ID)", nil
+	if isSelfRecipient(recipient) {
+		recipientJID, err = pickSelfChatJID(client.Store.GetJID(), client.Store.GetLID(), client.Store.LIDMigrationTimestamp > 0)
+		if err != nil {
+			return false, err.Error(), nil
 		}
-		recipientJID = client.Store.ID.ToNonAD()
 	} else if strings.Contains(recipient, "@") {
 		// Parse the JID string
 		recipientJID, err = types.ParseJID(recipient)
@@ -244,6 +310,10 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			User:   recipient,
 			Server: "s.whatsapp.net", // For personal chats
 		}
+	}
+	recipientJID, err = resolveSendJID(context.Background(), client, recipientJID)
+	if err != nil {
+		return false, fmt.Sprintf("Error resolving recipient: %v", err), nil
 	}
 
 	msg := &waProto.Message{}
@@ -302,10 +372,12 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Upload media to WhatsApp servers
 		resp, err := client.Upload(context.Background(), mediaData, mediaType)
 		if err != nil {
-			return false, fmt.Sprintf("Error uploading media: %v", err), nil
+			// Upload errors can embed the upload URL with its auth query parameter.
+			return false, fmt.Sprintf("Error uploading media: %s", redactURLs(err.Error())), nil
 		}
 
-		fmt.Println("Media uploaded", resp)
+		// Redacted log: upload resp carries URL/direct path/media key
+		fmt.Printf("Media uploaded (%d bytes)\n", resp.FileLength)
 
 		// Create the appropriate message type based on media type
 		switch mediaType {
@@ -534,11 +606,16 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			direction = "→"
 		}
 
-		// Log based on message type
+		// Log based on message type. Message text is only logged when
+		// WHATSAPP_LOG_CONTENT=1, so the bridge log does not hold message bodies.
+		logged := "[text redacted]"
+		if logMessageContent {
+			logged = content
+		}
 		if mediaType != "" {
-			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
+			fmt.Printf("[%s] %s %s: [%s] %s\n", timestamp, direction, sender, mediaType, logged)
 		} else if content != "" {
-			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
+			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, logged)
 		}
 	}
 }
@@ -634,9 +711,11 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var fileLength uint64
 	var err error
 
-	// First, check if we already have this file
-	chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(chatJID, ":", "_"))
-	localPath := ""
+	// Per-chat media directory; the chat JID must form a single path component.
+	chatDir, err := mediaChatDir("store", chatJID)
+	if err != nil {
+		return false, "", "", "", err
+	}
 
 	// Get media info from the database
 	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, err = messageStore.GetMediaInfo(messageID, chatJID)
@@ -668,28 +747,22 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
-	// Generate a local path for the file
-	localPath = filepath.Join(chatDir, filename)
-
-	// Defense in depth: ensure the resolved path stays under the chat directory.
-	absChatDir, err := filepath.Abs(chatDir)
-	if err != nil {
-		return false, "", "", "", fmt.Errorf("failed to resolve chat directory: %v", err)
-	}
-	absLocal, err := filepath.Abs(localPath)
-	if err != nil {
-		return false, "", "", "", fmt.Errorf("failed to resolve media path: %v", err)
-	}
-	if absLocal != absChatDir && !strings.HasPrefix(absLocal, absChatDir+string(os.PathSeparator)) {
+	// Candidate paths: <chatDir>/<sha256>/<filename> and the older <chatDir>/<filename>.
+	// filename is a single path component, so both stay inside chatDir.
+	candidates := mediaReadCandidates(chatDir, filename, fileSHA256)
+	writePath := candidates[0]
+	if filepath.Dir(filepath.Dir(writePath)) != filepath.Clean(chatDir) || filepath.Dir(candidates[1]) != filepath.Clean(chatDir) {
 		return false, "", "", "", fmt.Errorf("refusing to write media outside chat directory")
 	}
 
-	absPath := absLocal
-
-	// Check if file already exists
-	if _, err := os.Stat(localPath); err == nil {
-		// File exists, return it
-		return true, mediaType, filename, absPath, nil
+	// Reuse an existing file only if its content hash matches this message's media,
+	// so a different message's file with the same name is never returned.
+	if cached, ok := findCachedMedia(candidates, fileSHA256); ok {
+		absPath, err := filepath.Abs(cached)
+		if err != nil {
+			return false, "", "", "", fmt.Errorf("failed to resolve media path: %v", err)
+		}
+		return true, mediaType, filepath.Base(cached), absPath, nil
 	}
 
 	// If we don't have all the media info we need, we can't download
@@ -733,17 +806,27 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		// Redacted log: never print the directPath/url (carries oh/oe auth tokens)
 		// or media keys. Message id + type + error is enough to diagnose (e.g. an
 		// expired-token 403 on old history-synced media).
-		fmt.Printf("Failed to download %s media for message %s: %v\n", mediaType, messageID, err)
-		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
+		// Transport errors (url.Error) embed the full request URL, so strip query strings.
+		safeErr := redactURLs(err.Error())
+		fmt.Printf("Failed to download %s media for message %s: %s\n", mediaType, messageID, safeErr)
+		return false, "", "", "", fmt.Errorf("failed to download media: %s", safeErr)
 	}
 
-	// Save the downloaded media to file
-	if err := os.WriteFile(localPath, mediaData, 0644); err != nil {
+	// Save under the content-addressed path; never over another attachment's file.
+	localPath := writePath
+	if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
+		return false, "", "", "", fmt.Errorf("failed to create media directory: %v", err)
+	}
+	if err := writeFileAtomic(localPath, mediaData, 0644); err != nil {
 		return false, "", "", "", fmt.Errorf("failed to save media file: %v", err)
+	}
+	absPath, err := filepath.Abs(localPath)
+	if err != nil {
+		return false, "", "", "", fmt.Errorf("failed to resolve media path: %v", err)
 	}
 
 	fmt.Printf("Successfully downloaded %s media to %s (%d bytes)\n", mediaType, absPath, len(mediaData))
-	return true, mediaType, filename, absPath, nil
+	return true, mediaType, filepath.Base(localPath), absPath, nil
 }
 
 // sanitizeMediaFilename reduces an untrusted, sender-supplied media filename to a safe
@@ -752,7 +835,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 func sanitizeMediaFilename(filename, mediaType, messageID string) string {
 	filename = filepath.Base(filename)
 	if filename == "" || filename == "." || filename == ".." || strings.ContainsRune(filename, os.PathSeparator) {
-		return fmt.Sprintf("%s_%s", mediaType, messageID)
+		return fmt.Sprintf("%s_%s", mediaType, safeIDComponent(messageID))
 	}
 	return filename
 }
@@ -772,7 +855,7 @@ func extractDirectPathFromURL(url string) string {
 	// Find the path part after the domain, keeping the query string intact.
 	parts := strings.SplitN(url, ".net/", 2)
 	if len(parts) < 2 {
-		return url // already relative or unparseable — return as-is
+		return url // already relative or unparseable: return as-is
 	}
 
 	return "/" + parts[1]
@@ -781,7 +864,7 @@ func extractDirectPathFromURL(url string) string {
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
 	// Handler for sending messages
-	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/send", guardAPI(func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -790,7 +873,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 		// Parse the request body
 		var req SendMessageRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := decodeJSONBody(r, &req); err != nil {
 			http.Error(w, "Invalid request format", http.StatusBadRequest)
 			return
 		}
@@ -806,12 +889,26 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
+		if req.Draft && !isSelfRecipient(req.Recipient) {
+			http.Error(w, "Drafts can only be posted to self", http.StatusBadRequest)
+			return
+		}
+
 		// Redacted log: don't print message content. hasMedia flag is enough context.
-		fmt.Printf("Received send request to %s (media=%t)\n", req.Recipient, req.MediaPath != "")
+		fmt.Printf("Received send request to %s (media=%t, draft=%t)\n", req.Recipient, req.MediaPath != "", req.Draft)
 
 		// Send the message
 		success, message, result := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message send result:", success, message)
+		var draftRecorded *bool
+		if success && req.Draft && result != nil {
+			recorded := true
+			if err := messageStore.StoreDraft(result.MessageID, result.ChatJID); err != nil {
+				fmt.Printf("Failed to record draft %s: %v\n", result.MessageID, err)
+				recorded = false
+			}
+			draftRecorded = &recorded
+		}
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
 
@@ -830,26 +927,31 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			resp.ChatJID = result.ChatJID
 			resp.Timestamp = result.Timestamp
 		}
+		resp.DraftRecorded = draftRecorded
 		json.NewEncoder(w).Encode(resp)
-	})
+	}))
 
-	// Handler for editing a previously sent message (used by the draft feature to
-	// revise a draft posted to the self-chat). Text edits only; WhatsApp allows
+	// Handler for editing a draft posted to the self-chat by /api/send with
+	// "draft": true (other messages are refused). Text edits only; WhatsApp allows
 	// edits for ~20 minutes after sending (whatsmeow EditWindow), after which the
 	// server rejects them.
-	http.HandleFunc("/api/edit", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/edit", guardAPI(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
 		var req EditMessageRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := decodeJSONBody(r, &req); err != nil {
 			http.Error(w, "Invalid request format", http.StatusBadRequest)
 			return
 		}
 		if req.ChatJID == "" || req.MessageID == "" || req.NewMessage == "" {
 			http.Error(w, "chat_jid, message_id and new_message are required", http.StatusBadRequest)
+			return
+		}
+		if reason := checkDraftTarget(messageStore, req.ChatJID, req.MessageID, client.Store.GetJID(), client.Store.GetLID()); reason != "" {
+			http.Error(w, reason, http.StatusForbidden)
 			return
 		}
 
@@ -861,18 +963,18 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			w.WriteHeader(http.StatusInternalServerError)
 		}
 		json.NewEncoder(w).Encode(SendMessageResponse{Success: success, Message: message})
-	})
+	}))
 
-	// Handler for revoking (deleting-for-everyone) a previously sent message, e.g.
-	// to remove a stale draft from the self-chat.
-	http.HandleFunc("/api/revoke", func(w http.ResponseWriter, r *http.Request) {
+	// Handler for revoking (deleting-for-everyone) a draft posted to the self-chat
+	// by /api/send with "draft": true (other messages are refused).
+	http.HandleFunc("/api/revoke", guardAPI(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 
 		var req RevokeMessageRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := decodeJSONBody(r, &req); err != nil {
 			http.Error(w, "Invalid request format", http.StatusBadRequest)
 			return
 		}
@@ -880,19 +982,28 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			http.Error(w, "chat_jid and message_id are required", http.StatusBadRequest)
 			return
 		}
+		if reason := checkDraftTarget(messageStore, req.ChatJID, req.MessageID, client.Store.GetJID(), client.Store.GetLID()); reason != "" {
+			http.Error(w, reason, http.StatusForbidden)
+			return
+		}
 
 		success, message := revokeWhatsAppMessage(client, req.ChatJID, req.MessageID)
 		fmt.Println("Message revoke result:", success, message)
+		if success {
+			if err := messageStore.DeleteDraft(req.MessageID, req.ChatJID); err != nil {
+				fmt.Printf("Failed to forget revoked draft %s: %v\n", req.MessageID, err)
+			}
+		}
 
 		w.Header().Set("Content-Type", "application/json")
 		if !success {
 			w.WriteHeader(http.StatusInternalServerError)
 		}
 		json.NewEncoder(w).Encode(SendMessageResponse{Success: success, Message: message})
-	})
+	}))
 
 	// Handler for downloading media
-	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/download", guardAPI(func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -901,7 +1012,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 		// Parse the request body
 		var req DownloadMediaRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := decodeJSONBody(r, &req); err != nil {
 			http.Error(w, "Invalid request format", http.StatusBadRequest)
 			return
 		}
@@ -940,7 +1051,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Filename: filename,
 			Path:     path,
 		})
-	})
+	}))
 
 	// Start the server
 	// Bind to loopback only: the local Python MCP server connects via http://localhost:8080
@@ -991,7 +1102,8 @@ func main() {
 	}
 
 	// Create client instance
-	client := whatsmeow.NewClient(deviceStore, logger)
+	// whatsmeow logs some errors that embed signed media URLs; strip their query strings.
+	client := whatsmeow.NewClient(deviceStore, newRedactingLogger(logger))
 	if client == nil {
 		logger.Errorf("Failed to create WhatsApp client")
 		return
@@ -1244,8 +1356,10 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg.Message.Message)
 				}
 
-				// Log the message content for debugging
-				logger.Infof("Message content: %v, Media Type: %v", content, mediaType)
+				// Log the message for debugging (text only with WHATSAPP_LOG_CONTENT=1)
+				if logMessageContent {
+					logger.Infof("Message content: %v, Media Type: %v", content, mediaType)
+				}
 
 				// Skip messages with no content and no media
 				if content == "" && mediaType == "" {
@@ -1304,12 +1418,16 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 				} else {
 					syncedCount++
 					// Log successful message storage
+					logged := "[text redacted]"
+					if logMessageContent {
+						logged = content
+					}
 					if mediaType != "" {
-						logger.Infof("Stored message: [%s] %s -> %s: [%s: %s] %s",
-							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, mediaType, filename, content)
+						logger.Infof("Stored message: [%s] %s -> %s: [%s] %s",
+							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, mediaType, logged)
 					} else {
 						logger.Infof("Stored message: [%s] %s -> %s: %s",
-							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, content)
+							timestamp.Format("2006-01-02 15:04:05"), sender, chatJID, logged)
 					}
 				}
 			}
