@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -146,5 +147,79 @@ func TestRedactingLoggerStripsSignedURLs(t *testing.T) {
 	}
 	if len(lines) != 3 || lines[2] != "plain 42" {
 		t.Fatalf("unexpected log lines: %q", lines)
+	}
+}
+
+func TestGetEnvDefaults(t *testing.T) {
+	t.Setenv("WA_TEST_STR", "")
+	if got := getEnv("WA_TEST_STR", "store"); got != "store" {
+		t.Fatalf("empty env: got %q want store", got)
+	}
+	t.Setenv("WA_TEST_STR", "store-2")
+	if got := getEnv("WA_TEST_STR", "store"); got != "store-2" {
+		t.Fatalf("set env: got %q want store-2", got)
+	}
+}
+
+func TestParsePortEnv(t *testing.T) {
+	valid := []struct {
+		val  string
+		want int
+	}{
+		{"", 8080},
+		{"   ", 8080},
+		{"8081", 8081},
+		{" 8081 ", 8081},
+		{"65535", 65535},
+	}
+	for _, c := range valid {
+		t.Setenv("WA_TEST_PORT", c.val)
+		got, err := parsePortEnv("WA_TEST_PORT", 8080)
+		if err != nil || got != c.want {
+			t.Errorf("parsePortEnv(%q) = %d, %v; want %d, nil", c.val, got, err, c.want)
+		}
+	}
+	// Explicit but invalid values are errors, never a silent fallback to 8080.
+	for _, bad := range []string{"abc", "0", "-1", "70000", "80 81", "8081x"} {
+		t.Setenv("WA_TEST_PORT", bad)
+		if got, err := parsePortEnv("WA_TEST_PORT", 8080); err == nil {
+			t.Errorf("parsePortEnv(%q) = %d, want error", bad, got)
+		}
+	}
+}
+
+func TestValidateStoreDir(t *testing.T) {
+	for _, ok := range []string{"store", "store-2", "/tmp/wa store/acct 1", "./a_b.c"} {
+		if err := validateStoreDir(ok); err != nil {
+			t.Errorf("validateStoreDir(%q) = %v, want nil", ok, err)
+		}
+	}
+	for _, bad := range []string{"store?mode=ro", "a#b", "store%20x"} {
+		if err := validateStoreDir(bad); err == nil {
+			t.Errorf("validateStoreDir(%q) should fail", bad)
+		}
+	}
+}
+
+func TestListenAPIBindsLoopbackAndFailsOnBusyPort(t *testing.T) {
+	// Occupy an ephemeral loopback port (never the bridge's real port).
+	busy, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("cannot open a loopback listener: %v", err)
+	}
+	defer busy.Close()
+	port := busy.Addr().(*net.TCPAddr).Port
+	if _, err := listenAPI(port); err == nil {
+		t.Fatalf("listenAPI on a busy port must fail")
+	}
+
+	busy.Close()
+	ln, err := listenAPI(port)
+	if err != nil {
+		t.Skipf("port %d not reusable right away: %v", port, err)
+	}
+	defer ln.Close()
+	if ip := ln.Addr().(*net.TCPAddr).IP; !ip.IsLoopback() {
+		t.Fatalf("API must bind loopback only, got %s", ip)
 	}
 }

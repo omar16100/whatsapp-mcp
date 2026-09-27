@@ -1,3 +1,9 @@
+import logging
+import sys
+
+# stderr only: stdout is the MCP stdio channel
+logging.basicConfig(stream=sys.stderr, level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+
 from typing import List, Dict, Any, Optional
 from mcp.server.fastmcp import FastMCP
 from whatsapp import (
