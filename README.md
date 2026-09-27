@@ -39,8 +39,12 @@ Here's an example of what you can do when it's connected to Claude.
 
    ```bash
    cd whatsapp-bridge
-   go run main.go
+   go run .
    ```
+
+   The bridge is split across several Go files, so run or build the package (`go run .`,
+   `go build -o whatsapp-bridge-bin .`), not `go run main.go`; update older launch scripts that
+   use `go run main.go`.
 
    The first time you run it, you will be prompted to scan a QR code. Scan the QR code with your WhatsApp mobile app to authenticate.
 
@@ -99,7 +103,7 @@ If you're running this project on Windows, be aware that `go-sqlite3` requires *
    ```bash
    cd whatsapp-bridge
    go env -w CGO_ENABLED=1
-   go run main.go
+   go run .
    ```
 
 Without this setup, you'll likely run into errors like:
@@ -140,6 +144,28 @@ Claude can access the following tools to interact with WhatsApp:
 - **send_file**: Send a file (image, video, raw audio, document) to a specified recipient
 - **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
 - **download_media**: Download media from a WhatsApp message and get the local file path
+- **draft_message**: Draft a message for review WITHOUT sending it to the recipient. Posts a clean message (text and/or file attachment) to your own WhatsApp self-chat ("Message Yourself") so you can review it in WhatsApp and forward it to the real recipient yourself.
+- **revise_draft**: Edit the text of a draft in place (self-chat, text only, within WhatsApp's ~20 minute edit window).
+- **delete_draft**: Delete (revoke) a draft message from the self-chat.
+
+`revise_draft` and `delete_draft` only act on drafts posted by `draft_message`: the bridge records
+each draft's ID and refuses to edit or revoke any other message.
+
+### Drafts (review before sending)
+
+WhatsApp's API cannot place a draft in your phone's compose box, so `draft_message` posts the
+composed message into your own self-chat instead. Review it in WhatsApp, then forward it to the
+intended recipient. Notes:
+
+- The self-chat message is kept clean (no draft header) so forwarding delivers exactly the content;
+  who it's for is stated in the tool's reply, not injected into WhatsApp.
+- Supports text and a file attachment (with the text used as the caption). `.ogg` files are sent
+  as voice messages, which cannot carry text, so an `.ogg` draft with text is refused.
+- The bridge treats the recipient `self` or `me` as your own chat.
+- Draft contents are not added to the `messages` table of `messages.db` (whatsmeow doesn't
+  self-echo outgoing sends), so they appear only in WhatsApp. Their IDs are recorded in the
+  `drafts` table; `revise_draft`/`delete_draft` use the `message_id` + `chat_jid` returned by
+  `draft_message`.
 
 ### Media Handling Features
 
@@ -159,6 +185,16 @@ You can send various media types to your WhatsApp contacts:
 
 By default, just the metadata of the media is stored in the local database. The message will indicate that media was sent. To access this media you need to use the download_media tool which takes the `message_id` and `chat_jid` (which are shown when printing messages containing the meda), this downloads the media and then returns the file path which can be then opened or passed to another tool.
 
+> **Note on media expiry:** WhatsApp's CDN only serves media while the signed token in its URL is
+> valid. `download_media` works for media whose token is still valid, in practice recent media.
+> Older media, for example from the initial history sync, can fail with HTTP 403 once its token has
+> expired. Asking the sender's phone to re-upload it (media retry) is not implemented.
+>
+> Downloaded files are saved as `whatsapp-bridge/store/<chat_jid>/<sha256>/<filename>`, where
+> `<sha256>` is the hash of the file content, so attachments with the same name never overwrite
+> each other. Files saved by older versions as `store/<chat_jid>/<filename>` are reused only when
+> their SHA-256 matches the message's media.
+
 ## Technical Details
 
 1. Claude sends requests to the Python MCP server
@@ -166,6 +202,12 @@ By default, just the metadata of the media is stored in the local database. The 
 3. The Go accesses the WhatsApp API and keeps the SQLite database up to date
 4. Data flows back through the chain to Claude
 5. When sending messages, the request flows from Claude through the MCP server to the Go bridge and to WhatsApp
+
+The bridge's REST API (`/api/send`, `/api/download`, `/api/edit`, `/api/revoke`) has no
+authentication, so it listens on `127.0.0.1` only and refuses requests that look like they come
+from a web browser: a non-loopback `Host` header (DNS rebinding), any `Origin` header, or a body
+not sent as `application/json`. Message text is not written to the bridge log unless
+`WHATSAPP_LOG_CONTENT=1` is set.
 
 ## Troubleshooting
 
