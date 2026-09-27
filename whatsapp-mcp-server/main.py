@@ -12,7 +12,10 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    draft_to_self as whatsapp_draft_to_self,
+    edit_draft as whatsapp_edit_draft,
+    delete_draft as whatsapp_delete_draft,
 )
 
 # Initialize FastMCP server
@@ -245,6 +248,70 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+@mcp.tool()
+def draft_message(recipient: str, message: str = "", media_path: str = None) -> Dict[str, Any]:
+    """Draft a WhatsApp message for review WITHOUT sending it to the recipient.
+
+    This does NOT send anything to `recipient`. Instead it posts a single clean message
+    into the user's OWN WhatsApp self-chat ("Message Yourself") so they can read it inside
+    WhatsApp and forward it to the real recipient themselves. The message has no draft
+    header (so forwarding delivers exactly the intended content); tell the user who it's
+    for. Supports text and/or a file attachment (with the text as caption).
+
+    Use this whenever the user wants to review/approve a message before it actually goes out.
+
+    Args:
+        recipient: The intended final recipient (phone number without + or a JID). Used only
+                   in the header text; nothing is sent to them.
+        message: The message text (also used as the caption when media_path is given).
+        media_path: Optional absolute path to a file/document/image to include in the draft.
+
+    Returns:
+        A dictionary with success status, a status message, and the identifiers
+        (message_id, chat_jid) of the clean-content message so it can later be revised
+        with revise_draft or removed with delete_draft.
+    """
+    success, status_message, ids = whatsapp_draft_to_self(recipient, message, media_path)
+    result = {"success": success, "message": status_message}
+    if ids:
+        result.update({k: v for k, v in ids.items() if v is not None})
+    return result
+
+
+@mcp.tool()
+def revise_draft(chat_jid: str, message_id: str, new_message: str) -> Dict[str, Any]:
+    """Revise the TEXT of a draft previously posted to the self-chat, in place.
+
+    Only works for text drafts and only within WhatsApp's ~20 minute edit window after
+    the draft was posted. For media drafts, delete_draft and draft_message again instead.
+
+    Args:
+        chat_jid: The chat_jid returned by draft_message (the self-chat JID).
+        message_id: The message_id returned by draft_message (the clean-content message).
+        new_message: The revised text.
+
+    Returns:
+        A dictionary containing success status and a status message.
+    """
+    success, status_message = whatsapp_edit_draft(chat_jid, message_id, new_message)
+    return {"success": success, "message": status_message}
+
+
+@mcp.tool()
+def delete_draft(chat_jid: str, message_id: str) -> Dict[str, Any]:
+    """Delete (revoke) a draft message previously posted to the self-chat.
+
+    Args:
+        chat_jid: The chat_jid returned by draft_message (the self-chat JID).
+        message_id: The message_id returned by draft_message.
+
+    Returns:
+        A dictionary containing success status and a status message.
+    """
+    success, status_message = whatsapp_delete_draft(chat_jid, message_id)
+    return {"success": success, "message": status_message}
+
 
 if __name__ == "__main__":
     # Initialize and run the server

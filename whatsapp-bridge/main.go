@@ -193,6 +193,19 @@ func extractTextContent(msg *waProto.Message) string {
 type SendMessageResponse struct {
 	Success bool   `json:"success"`
 	Message string `json:"message"`
+	// Identifiers of the sent message, needed for follow-up edit/revoke (e.g. drafts).
+	// ChatJID is the actual resolved recipient JID (after any LID rewrite), so callers
+	// must reuse it verbatim rather than reconstructing it.
+	MessageID string `json:"message_id,omitempty"`
+	ChatJID   string `json:"chat_jid,omitempty"`
+	Timestamp string `json:"timestamp,omitempty"`
+}
+
+// SendResult carries the identifiers of a successfully sent message.
+type SendResult struct {
+	MessageID string
+	ChatJID   string
+	Timestamp string
 }
 
 // SendMessageRequest represents the request body for the send message API
@@ -203,23 +216,27 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string, *SendResult) {
 	if !client.IsConnected() {
-		return false, "Not connected to WhatsApp"
+		return false, "Not connected to WhatsApp", nil
 	}
 
 	// Create JID for recipient
 	var recipientJID types.JID
 	var err error
 
-	// Check if recipient is a JID
-	isJID := strings.Contains(recipient, "@")
-
-	if isJID {
+	// "self"/"me" targets the linked account's own chat ("Message Yourself"),
+	// used by the draft feature so a message appears in the user's own WhatsApp.
+	if recipient == "self" || recipient == "me" {
+		if client.Store.ID == nil {
+			return false, "Not logged in (no device ID)", nil
+		}
+		recipientJID = client.Store.ID.ToNonAD()
+	} else if strings.Contains(recipient, "@") {
 		// Parse the JID string
 		recipientJID, err = types.ParseJID(recipient)
 		if err != nil {
-			return false, fmt.Sprintf("Error parsing JID: %v", err)
+			return false, fmt.Sprintf("Error parsing JID: %v", err), nil
 		}
 	} else {
 		// Create JID from phone number
@@ -236,7 +253,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Read media file
 		mediaData, err := os.ReadFile(mediaPath)
 		if err != nil {
-			return false, fmt.Sprintf("Error reading media file: %v", err)
+			return false, fmt.Sprintf("Error reading media file: %v", err), nil
 		}
 
 		// Determine media type and mime type based on file extension
@@ -285,7 +302,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		// Upload media to WhatsApp servers
 		resp, err := client.Upload(context.Background(), mediaData, mediaType)
 		if err != nil {
-			return false, fmt.Sprintf("Error uploading media: %v", err)
+			return false, fmt.Sprintf("Error uploading media: %v", err), nil
 		}
 
 		fmt.Println("Media uploaded", resp)
@@ -315,7 +332,7 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 					seconds = analyzedSeconds
 					waveform = analyzedWaveform
 				} else {
-					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err)
+					return false, fmt.Sprintf("Failed to analyze Ogg Opus file: %v", err), nil
 				}
 			} else {
 				fmt.Printf("Not an Ogg Opus file: %s\n", mimeType)
@@ -362,13 +379,69 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
-		return false, fmt.Sprintf("Error sending message: %v", err)
+		return false, fmt.Sprintf("Error sending message: %v", err), nil
 	}
 
-	return true, fmt.Sprintf("Message sent to %s", recipient)
+	result := &SendResult{
+		MessageID: resp.ID,
+		ChatJID:   recipientJID.String(),
+		Timestamp: resp.Timestamp.Format(time.RFC3339),
+	}
+	return true, fmt.Sprintf("Message sent to %s", recipient), result
+}
+
+// EditMessageRequest is the body for POST /api/edit.
+type EditMessageRequest struct {
+	ChatJID    string `json:"chat_jid"`
+	MessageID  string `json:"message_id"`
+	NewMessage string `json:"new_message"`
+}
+
+// RevokeMessageRequest is the body for POST /api/revoke.
+type RevokeMessageRequest struct {
+	ChatJID   string `json:"chat_jid"`
+	MessageID string `json:"message_id"`
+}
+
+// editWhatsAppMessage edits the text of a previously sent message. Text only.
+func editWhatsAppMessage(client *whatsmeow.Client, chatJID, messageID, newMessage string) (bool, string) {
+	if !client.IsConnected() {
+		return false, "Not connected to WhatsApp"
+	}
+
+	chat, err := types.ParseJID(chatJID)
+	if err != nil {
+		return false, fmt.Sprintf("Error parsing chat JID: %v", err)
+	}
+
+	newContent := &waProto.Message{Conversation: proto.String(newMessage)}
+	_, err = client.SendMessage(context.Background(), chat, client.BuildEdit(chat, messageID, newContent))
+	if err != nil {
+		// A common cause is the ~20 minute edit window having elapsed.
+		return false, fmt.Sprintf("Error editing message (note: edits only work for ~20 min after sending): %v", err)
+	}
+	return true, fmt.Sprintf("Message %s edited", messageID)
+}
+
+// revokeWhatsAppMessage deletes a previously sent message for everyone.
+func revokeWhatsAppMessage(client *whatsmeow.Client, chatJID, messageID string) (bool, string) {
+	if !client.IsConnected() {
+		return false, "Not connected to WhatsApp"
+	}
+
+	chat, err := types.ParseJID(chatJID)
+	if err != nil {
+		return false, fmt.Sprintf("Error parsing chat JID: %v", err)
+	}
+
+	_, err = client.SendMessage(context.Background(), chat, client.BuildRevoke(chat, types.EmptyJID, messageID))
+	if err != nil {
+		return false, fmt.Sprintf("Error revoking message: %v", err)
+	}
+	return true, fmt.Sprintf("Message %s revoked", messageID)
 }
 
 // Extract media info from a message
@@ -585,19 +658,33 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("not a media message")
 	}
 
+	// Sanitize the filename: it comes from the sender (doc.GetFileName()) and is untrusted.
+	// Strip any directory components so a crafted name like "../../etc/passwd" cannot escape
+	// the chat directory when we build the local path below.
+	filename = sanitizeMediaFilename(filename, mediaType, messageID)
+
 	// Create directory for the chat if it doesn't exist
 	if err := os.MkdirAll(chatDir, 0755); err != nil {
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
 	// Generate a local path for the file
-	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
+	localPath = filepath.Join(chatDir, filename)
 
-	// Get absolute path
-	absPath, err := filepath.Abs(localPath)
+	// Defense in depth: ensure the resolved path stays under the chat directory.
+	absChatDir, err := filepath.Abs(chatDir)
 	if err != nil {
-		return false, "", "", "", fmt.Errorf("failed to get absolute path: %v", err)
+		return false, "", "", "", fmt.Errorf("failed to resolve chat directory: %v", err)
 	}
+	absLocal, err := filepath.Abs(localPath)
+	if err != nil {
+		return false, "", "", "", fmt.Errorf("failed to resolve media path: %v", err)
+	}
+	if absLocal != absChatDir && !strings.HasPrefix(absLocal, absChatDir+string(os.PathSeparator)) {
+		return false, "", "", "", fmt.Errorf("refusing to write media outside chat directory")
+	}
+
+	absPath := absLocal
 
 	// Check if file already exists
 	if _, err := os.Stat(localPath); err == nil {
@@ -643,6 +730,10 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	// Download the media using whatsmeow client
 	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
+		// Redacted log: never print the directPath/url (carries oh/oe auth tokens)
+		// or media keys. Message id + type + error is enough to diagnose (e.g. an
+		// expired-token 403 on old history-synced media).
+		fmt.Printf("Failed to download %s media for message %s: %v\n", mediaType, messageID, err)
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
 
@@ -655,24 +746,36 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	return true, mediaType, filename, absPath, nil
 }
 
-// Extract direct path from a WhatsApp media URL
-func extractDirectPathFromURL(url string) string {
-	// The direct path is typically in the URL, we need to extract it
-	// Example URL: https://mmg.whatsapp.net/v/t62.7118-24/13812002_698058036224062_3424455886509161511_n.enc?ccb=11-4&oh=...
+// sanitizeMediaFilename reduces an untrusted, sender-supplied media filename to a safe
+// basename that cannot escape the chat directory. Falls back to "<mediaType>_<messageID>"
+// when the name is empty or resolves to a directory component.
+func sanitizeMediaFilename(filename, mediaType, messageID string) string {
+	filename = filepath.Base(filename)
+	if filename == "" || filename == "." || filename == ".." || strings.ContainsRune(filename, os.PathSeparator) {
+		return fmt.Sprintf("%s_%s", mediaType, messageID)
+	}
+	return filename
+}
 
-	// Find the path part after the domain
+// Extract direct path from a WhatsApp media URL.
+//
+// The query string MUST be preserved byte-for-byte. whatsmeow's Download builds
+// its request as "https://{host}{directPath}&hash=...&mms-type=...&__wa-mms=",
+// appending &hash=... on the assumption that directPath already carries a ?query.
+// The ?ccb/oh/oe tokens in that query are the ONLY CDN authorization (whatsmeow
+// adds no auth header), so stripping them yields an unauthenticated URL -> HTTP 403.
+// Do not parse/re-encode the query (url.Values.Encode reorders and would break the
+// oh HMAC); a plain string slice keeps it verbatim.
+//
+// Example URL: https://mmg.whatsapp.net/v/t62.7118-24/1381..._n.enc?ccb=11-4&oh=...&oe=...
+func extractDirectPathFromURL(url string) string {
+	// Find the path part after the domain, keeping the query string intact.
 	parts := strings.SplitN(url, ".net/", 2)
 	if len(parts) < 2 {
-		return url // Return original URL if parsing fails
+		return url // already relative or unparseable — return as-is
 	}
 
-	pathPart := parts[1]
-
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
-	return "/" + pathPart
+	return "/" + parts[1]
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
@@ -703,11 +806,12 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
-		fmt.Println("Received request to send message", req.Message, req.MediaPath)
+		// Redacted log: don't print message content. hasMedia flag is enough context.
+		fmt.Printf("Received send request to %s (media=%t)\n", req.Recipient, req.MediaPath != "")
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
-		fmt.Println("Message sent", success, message)
+		success, message, result := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		fmt.Println("Message send result:", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
 
@@ -717,10 +821,74 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		}
 
 		// Send response
-		json.NewEncoder(w).Encode(SendMessageResponse{
+		resp := SendMessageResponse{
 			Success: success,
 			Message: message,
-		})
+		}
+		if result != nil {
+			resp.MessageID = result.MessageID
+			resp.ChatJID = result.ChatJID
+			resp.Timestamp = result.Timestamp
+		}
+		json.NewEncoder(w).Encode(resp)
+	})
+
+	// Handler for editing a previously sent message (used by the draft feature to
+	// revise a draft posted to the self-chat). Text edits only; WhatsApp allows
+	// edits for ~20 minutes after sending (whatsmeow EditWindow), after which the
+	// server rejects them.
+	http.HandleFunc("/api/edit", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req EditMessageRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.ChatJID == "" || req.MessageID == "" || req.NewMessage == "" {
+			http.Error(w, "chat_jid, message_id and new_message are required", http.StatusBadRequest)
+			return
+		}
+
+		success, message := editWhatsAppMessage(client, req.ChatJID, req.MessageID, req.NewMessage)
+		fmt.Println("Message edit result:", success, message)
+
+		w.Header().Set("Content-Type", "application/json")
+		if !success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(SendMessageResponse{Success: success, Message: message})
+	})
+
+	// Handler for revoking (deleting-for-everyone) a previously sent message, e.g.
+	// to remove a stale draft from the self-chat.
+	http.HandleFunc("/api/revoke", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req RevokeMessageRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.ChatJID == "" || req.MessageID == "" {
+			http.Error(w, "chat_jid and message_id are required", http.StatusBadRequest)
+			return
+		}
+
+		success, message := revokeWhatsAppMessage(client, req.ChatJID, req.MessageID)
+		fmt.Println("Message revoke result:", success, message)
+
+		w.Header().Set("Content-Type", "application/json")
+		if !success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(SendMessageResponse{Success: success, Message: message})
 	})
 
 	// Handler for downloading media
@@ -775,7 +943,10 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
+	// Bind to loopback only: the local Python MCP server connects via http://localhost:8080
+	// and these endpoints (send/edit/revoke) are unauthenticated, so they must not be exposed
+	// on other interfaces (e.g. Tailscale/LAN).
+	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
@@ -870,6 +1041,7 @@ func main() {
 		for evt := range qrChan {
 			if evt.Event == "code" {
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
+				fmt.Println("WHATSAPP_QR_CODE>>>" + evt.Code)
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
 			} else if evt.Event == "success" {
 				connected <- true

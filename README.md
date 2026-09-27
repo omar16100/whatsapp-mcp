@@ -140,6 +140,22 @@ Claude can access the following tools to interact with WhatsApp:
 - **send_file**: Send a file (image, video, raw audio, document) to a specified recipient
 - **send_audio_message**: Send an audio file as a WhatsApp voice message (requires the file to be an .ogg opus file or ffmpeg must be installed)
 - **download_media**: Download media from a WhatsApp message and get the local file path
+- **draft_message**: Draft a message for review WITHOUT sending it to the recipient. Posts a clean message (text and/or file attachment) to your own WhatsApp self-chat ("Message Yourself") so you can review it in WhatsApp and forward it to the real recipient yourself.
+- **revise_draft**: Edit the text of a draft in place (self-chat, text only, within WhatsApp's ~20 minute edit window).
+- **delete_draft**: Delete (revoke) a draft message from the self-chat.
+
+### Drafts (review before sending)
+
+WhatsApp's API cannot place a draft in your phone's compose box, so `draft_message` posts the
+composed message into your own self-chat instead. Review it in WhatsApp, then forward it to the
+intended recipient. Notes:
+
+- The self-chat message is kept clean (no draft header) so forwarding delivers exactly the content;
+  who it's for is stated in the tool's reply, not injected into WhatsApp.
+- Supports text and a file attachment (with the text used as the caption).
+- Drafts posted this way are NOT stored in the local `messages.db` (whatsmeow doesn't self-echo
+  outgoing sends), so they appear only in WhatsApp. `revise_draft`/`delete_draft` use the
+  `message_id` + `chat_jid` returned by `draft_message`.
 
 ### Media Handling Features
 
@@ -158,6 +174,11 @@ You can send various media types to your WhatsApp contacts:
 #### Media Downloading
 
 By default, just the metadata of the media is stored in the local database. The message will indicate that media was sent. To access this media you need to use the download_media tool which takes the `message_id` and `chat_jid` (which are shown when printing messages containing the meda), this downloads the media and then returns the file path which can be then opened or passed to another tool.
+
+> **Note on media expiry:** WhatsApp's CDN only serves media while its signed URL token is valid
+> (a few weeks). `download_media` works for any media whose token is still valid, which in practice
+> means recent media. Long-expired media from the initial history sync will fail to download (HTTP
+> 403) because the encrypted blob is no longer retrievable and its token has expired.
 
 ## Technical Details
 

@@ -765,3 +765,105 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         return None
+
+
+def _post_send(recipient: str, message: str = "", media_path: Optional[str] = None) -> Tuple[bool, str, Optional[dict]]:
+    """POST to the bridge /api/send and return (ok, info, ids).
+
+    Unlike send_message/send_file, this returns the message identifiers the bridge
+    now includes (message_id, chat_jid, timestamp) so drafts can be edited/revoked.
+    """
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/send"
+        payload = {"recipient": recipient}
+        if message:
+            payload["message"] = message
+        if media_path:
+            payload["media_path"] = media_path
+
+        response = requests.post(url, json=payload)
+        if response.status_code == 200:
+            result = response.json()
+            ids = {
+                "message_id": result.get("message_id"),
+                "chat_jid": result.get("chat_jid"),
+                "timestamp": result.get("timestamp"),
+            }
+            return result.get("success", False), result.get("message", "Unknown response"), ids
+        return False, f"Error: HTTP {response.status_code} - {response.text}", None
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}", None
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}", None
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}", None
+
+
+def draft_to_self(recipient: str, message: str = "", media_path: Optional[str] = None) -> Tuple[bool, str, Optional[dict]]:
+    """Post a draft to the user's own WhatsApp self-chat ("Message Yourself").
+
+    WhatsApp's API cannot place a draft in the phone's compose box, so instead this
+    posts a single clean message (text, or a file with the text as caption) into the
+    user's own chat. The user reviews it in WhatsApp and forwards it to the real
+    recipient. The message is kept clean (no draft header) precisely so forwarding it
+    delivers exactly the intended content; who it is for is communicated by the caller.
+
+    Returns (ok, info, ids) where ids belong to the posted message, so it can later be
+    edited in place (edit_draft) or removed (delete_draft) within the ~20 min window.
+    """
+    if not recipient:
+        return False, "Recipient must be provided", None
+    if not message and not media_path:
+        return False, "A message or media_path must be provided", None
+    if media_path and not os.path.isfile(media_path):
+        return False, f"Media file not found: {media_path}", None
+
+    # Post directly to /api/send (keeps the caption for media, which the send_file
+    # wrapper drops). recipient="self" resolves to the user's own JID in the bridge.
+    ok, info, ids = _post_send("self", message, media_path)
+    if not ok:
+        return False, f"Failed to post draft to self-chat: {info}", None
+    return True, f"Draft for {recipient} posted to your WhatsApp self-chat. Review it there and forward it to {recipient}.", ids
+
+
+def edit_draft(chat_jid: str, message_id: str, new_message: str) -> Tuple[bool, str]:
+    """Edit a text draft previously posted to the self-chat (via the bridge /api/edit).
+
+    Only works within WhatsApp's ~20 minute edit window and for text messages.
+    """
+    if not (chat_jid and message_id and new_message):
+        return False, "chat_jid, message_id and new_message are all required"
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/edit"
+        payload = {"chat_jid": chat_jid, "message_id": message_id, "new_message": new_message}
+        response = requests.post(url, json=payload)
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("success", False), result.get("message", "Unknown response")
+        return False, f"Error: HTTP {response.status_code} - {response.text}"
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+
+def delete_draft(chat_jid: str, message_id: str) -> Tuple[bool, str]:
+    """Delete (revoke for everyone) a draft message from the self-chat (bridge /api/revoke)."""
+    if not (chat_jid and message_id):
+        return False, "chat_jid and message_id are required"
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/revoke"
+        payload = {"chat_jid": chat_jid, "message_id": message_id}
+        response = requests.post(url, json=payload)
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("success", False), result.get("message", "Unknown response")
+        return False, f"Error: HTTP {response.status_code} - {response.text}"
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
